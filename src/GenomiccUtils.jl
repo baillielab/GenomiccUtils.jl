@@ -2,6 +2,7 @@ module GenomiccUtils
 
 using CSV
 using DataFrames
+using Base.Threads
 
 include("read_write.jl")
 include("ancestry.jl")
