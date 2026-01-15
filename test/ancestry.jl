@@ -49,7 +49,7 @@ end
     tmpdir = mktempdir()
     output = joinpath(tmpdir, "ancestry.csv")
     genotypes_prefix = joinpath(TESTDIR, "assets", "genotypes", "kgp.merged.unrelated.shared")
-    kgp_pedigree_file = joinpath("test", "assets", "genotypes", "kgp.pedigrees.txt")
+    kgp_pedigree_file = joinpath(TESTDIR, "assets", "genotypes", "kgp.pedigrees.txt")
     estimate_ancestry(genotypes_prefix, kgp_pedigree_file;
         mode="ml",
         output=output, 
