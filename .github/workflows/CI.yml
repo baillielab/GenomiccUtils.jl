@@ -31,6 +31,14 @@ jobs:
           - x64
     steps:
       - uses: actions/checkout@v4
+      - name: Install plink2
+        run: |
+          wget https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_x86_64_20250129.zip
+          unzip plink2_linux_x86_64_20250129.zip
+          sudo mv plink2 /usr/local/bin/
+          sudo chmod +x /usr/local/bin/plink2
+          rm plink2_linux_x86_64_20250129.zip
+          plink2 --version
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}

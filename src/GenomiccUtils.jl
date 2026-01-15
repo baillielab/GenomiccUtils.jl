@@ -4,7 +4,14 @@ using CSV
 using DataFrames
 using DelimitedFiles
 using Base.Threads
+using MLJTuning
+using MLJXGBoostInterface
+using MLJBase
+using StatisticalMeasures
+using MLJLinearModels
+using MLJTransforms
 
+include("pca.jl")
 include("read_write.jl")
 include("ancestry.jl")
 

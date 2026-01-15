@@ -22,16 +22,43 @@ function ancestry_from_fam(fam, index_to_pop; threshold=0.8)
     return ancestry
 end
 
+function extract_ref_alleles(input_prefix; tmpdir=mktempdir(), output_filename="ref_alleles.txt")
+    source_bim = read_bim(string(input_prefix, ".bim"))
+    output_file = joinpath(tmpdir, output_filename)
+    CSV.write(output_file, source_bim[!, [:VARIANT_ID, :ALLELE_1]], header=false, delim="\t")
+    return output_file
+end
 
-function estimate_ancestry(genotypes_prefix, pedigree_file; mode="admixture", output="ancestry.csv", threshold=0.8)
+function extract_population(input_prefix, individuals, ref_alleles_file; tmpdir=mktempdir(), output_prefix="kgp")
+    keep_file = joinpath(tmpdir, string(output_prefix, ".indiv.txt"))
+    CSV.write(keep_file, individuals[!, [:FID, :IID]], header=false, delim="\t")
+    full_output_prefix = joinpath(tmpdir, output_prefix)
+    run(`plink2 --bfile $input_prefix --keep $keep_file --make-bed --ref-allele $ref_alleles_file 2 1 --out $full_output_prefix`)
+    return full_output_prefix
+end
+
+function estimate_ancestry(genotypes_prefix, pedigree_file; 
+    mode="admixture", 
+    output="ancestry.csv", 
+    threshold=0.8,
+    model="xgboost",
+    npcs=20,
+    nfolds=10
+    )
     if mode == "admixture"
         return admixture_ancestry_estimation(genotypes_prefix, pedigree_file; output=output, threshold=threshold)
     elseif mode == "scope"
         return scope_ancestry_estimation(genotypes_prefix, pedigree_file; output=output, threshold=threshold)
+    elseif mode == "ml"
+        return ml_ancestry_estimation(genotypes_prefix, pedigree_file; output=output, threshold=threshold, model=model, npcs=npcs, nfolds=nfolds)
     else
         error("Unknown mode: $mode. Use 'admixture' or 'scope'.")
     end
 end
+
+#####################################################################
+####            Admixture Ancestry Estimation                     ###
+#####################################################################
 
 function admixture_ancestry_estimation(genotypes_prefix, pedigree_file; output="ancestry.csv", threshold=0.8)
     # Write known ancestries to file
@@ -67,6 +94,10 @@ function admixture_ancestry_estimation(genotypes_prefix, pedigree_file; output="
     )
 end
 
+#####################################################################
+####              SCOPE Ancestry Estimation                       ###
+#####################################################################
+
 
 function read_scope_ancestry_estimates(n_indiv, scope_ancestry_file)
     Q_lines = strip.(readlines(scope_ancestry_file))
@@ -92,14 +123,6 @@ function assign_scope_ancestry_estimates!(fam, Q; threshold=0.8, ordered_ancestr
     return fam
 end
 
-function extract_population(input_prefix, individuals; tmpdir=mktempdir(), output_prefix="kgp")
-    keep_file = joinpath(tmpdir, string(output_prefix, ".indiv.txt"))
-    CSV.write(keep_file, individuals[!, [:FID, :IID]], header=false, delim="\t")
-    full_output_prefix = joinpath(tmpdir, output_prefix)
-    run(`plink --bfile $input_prefix --keep $keep_file --make-bed --out $full_output_prefix`)
-    return full_output_prefix
-end
-
 
 function format_stratified_freqs(input_file, output_file)
     cluster_map = Dict("AFR" => "1", "AMR" => "2", "EAS" => "3", "EUR" => "4", "SAS" => "5")
@@ -121,12 +144,13 @@ function scope_ancestry_estimation(genotypes_prefix, kgp_pedigree_file; output="
     tmpdir = mktempdir()
     fam = read_fam(string(genotypes_prefix, ".fam"))
     kgp_pedigrees = CSV.read(kgp_pedigree_file, DataFrame, select=[:SampleID, :Superpopulation])
+    ref_alleles_file = extract_ref_alleles(genotypes_prefix; tmpdir=tmpdir, output_filename="ref_alleles.txt")
     # Write KGP genotypes
     kgp_individuals = filter(x -> x.IID ∈ kgp_pedigrees.SampleID, fam)
-    kgp_prefix = extract_population(genotypes_prefix, kgp_individuals; tmpdir=tmpdir, output_prefix="kgp")
+    kgp_prefix = extract_population(genotypes_prefix, kgp_individuals, ref_alleles_file; tmpdir=tmpdir, output_prefix="kgp")
     # Write Other cohort genotypes
     other_individuals = filter(x -> x.IID ∉ kgp_individuals.IID, fam)
-    other_prefix = extract_population(genotypes_prefix, other_individuals; tmpdir=tmpdir, output_prefix="other")
+    other_prefix = extract_population(genotypes_prefix, other_individuals, ref_alleles_file; tmpdir=tmpdir, output_prefix="other")
     # Write KGP superpopulation 
     kgp_fam = read_fam(string(kgp_prefix, ".fam"))
     pedigree = Dict(zip(kgp_pedigrees.SampleID, kgp_pedigrees.Superpopulation))
@@ -161,4 +185,94 @@ function scope_ancestry_estimation(genotypes_prefix, kgp_pedigree_file; output="
     rm(tmpdir, recursive=true)
     
     return 0
+end
+
+#####################################################################
+####                ML Ancestry Estimation                        ###
+#####################################################################
+
+function get_XGBoost_model(;loss=MisclassificationRate(), nfolds=3)
+    pipe = Standardizer() |> XGBoostClassifier(tree_method = "hist", seed=1)
+    r = [
+        range(pipe, :(xg_boost_classifier.max_depth), lower=3, upper=6),
+        range(pipe, :(xg_boost_classifier.lambda), lower=1e-4, upper=10, scale=:log)
+    ]
+    return TunedModel(
+        model=pipe,
+        resampling=StratifiedCV(nfolds=nfolds),
+        tuning=Grid(resolution=20),
+        range=r,
+        measure=loss
+    )
+end
+
+function get_logistic_classifier(;loss=MisclassificationRate(), nfolds=3)
+    pipe = Standardizer() |> LogisticClassifier()
+    return TunedModel(
+        model=pipe,
+        resampling=StratifiedCV(nfolds=nfolds),
+        tuning=Grid(resolution=20),
+        range=range(pipe, :(logistic_classifier.lambda), lower=1e-5, upper=10, scale=:log),
+        measure=loss
+    )
+end
+
+function ml_ancestry_estimation(genotypes_prefix, kgp_pedigree_file; 
+    output="ancestry.csv", 
+    threshold=0.8,
+    model="xgboost",
+    npcs=20,
+    nfolds=10
+    )
+
+    tmpdir = mktempdir()
+    fam = read_fam(string(genotypes_prefix, ".fam"))
+    kgp_pedigrees = CSV.read(kgp_pedigree_file, DataFrame, select=[:SampleID, :Superpopulation])
+    # Compute PCs on joint train (1000GP) and test dataset (Genomicc or UKBiobank)
+    # While this induces some data leakage, only fitting PCA on the train data leads to very poor perfomance on test set
+    pcs = plink2_pca_approx(genotypes_prefix; npcs=npcs, output_prefix=joinpath(tmpdir, "pcs"))
+
+    # Train ML model on KGP
+    train_dataset = filter(x -> x.IID ∈ kgp_pedigrees.SampleID, pcs)
+    train_dataset = innerjoin(train_dataset, kgp_pedigrees, on=:IID => :SampleID)
+    X_train = train_dataset[!, ["PC$i" for i in 1:npcs]]
+    y_train = categorical(train_dataset.Superpopulation)
+    loss = MisclassificationRate()
+    model = model == "xgboost" ? 
+        get_XGBoost_model(;loss=loss, nfolds=nfolds) :
+        get_logistic_classifier(;loss=loss, nfolds=nfolds)
+    mach = machine(model, X_train, y_train)
+    fit!(mach)
+    @info string("Training Loss: ", loss(predict_mode(mach), y_train))
+    @info string("CV Loss: ", report(mach).best_history_entry.evaluation)
+
+    # Predict ancestries on test cohort
+    test_dataset = filter(x -> x.IID ∉ train_dataset.IID, pcs)
+    X_other = test_dataset[!, ["PC$i" for i in 1:npcs]]
+    ## Ancestry probabilities
+    ŷ = predict(mach, X_other)
+    ancestry_estimates = DataFrame()
+    for (class_index, probas) in ŷ.prob_given_ref
+        ancestry_estimates[!, string(ŷ.decoder.classes[class_index])] = probas
+    end
+    ## Ancestry hardcall
+    ancestry_estimates.Superpopulation = map(eachrow(ancestry_estimates)) do row
+        max_proba, max_class = findmax(row)
+        if max_proba >= threshold
+            string(max_class)
+        else
+            "ADMIXED"
+        end
+    end
+    ## Add back sample FID/IID
+    ancestry_estimates.FID = test_dataset[!, "#FID"]
+    ancestry_estimates.IID = test_dataset.IID
+    # Save
+    CSV.write(
+        output, 
+        DataFrames.select(ancestry_estimates, :FID, :IID, :Superpopulation, :AFR, :AMR, :EAS, :EUR, :SAS), 
+        header=true
+    )
+    # Clean up
+    rm(tmpdir, recursive=true)
 end
